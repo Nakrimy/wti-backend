@@ -9,10 +9,12 @@ const Database = require('better-sqlite3');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-super-secret';
-const DB = new Database('wti.db', { fileMustExist: false });
+const DB_FILE = process.env.SQLITE_FILE || 'wti.db';
+const FRONTEND_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:8080';
 
-// ---------------- DB INIT ----------------
-DB.pragma('journal_mode = WAL');
+const DB = new Database(DB_FILE);
+
+// --- DB init ---
 DB.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,133 +24,94 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `);
 
-// ---------------- MIDDLEWARE ----------------
-// IMPORTANT: allow credentials + your frontend origin (http-server)
-const FRONTEND_ORIGINS = [
-  'http://127.0.0.1:8080',
-  'http://localhost:8080',
-];
-
+// --- Middleware ---
+app.set('trust proxy', 1); // needed for secure cookies on Render
 app.use(cors({
-  origin(origin, cb) {
-    // During local dev, origin may be undefined (like curl/Postman) — allow it.
-    if (!origin || FRONTEND_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error(`Origin not allowed: ${origin}`));
-  },
+  origin: FRONTEND_ORIGIN,
   credentials: true,
 }));
-
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 app.use(cookieParser());
 
-// ---------------- HELPERS ----------------
+// --- Helpers ---
 const normEmail = (e) => String(e || '').trim().toLowerCase();
-
 function setAuthCookie(res, token) {
   res.cookie('wti_jwt', token, {
     httpOnly: true,
-    sameSite: 'lax',   // OK for cross-site nav within same top site
-    secure: false,     // true ONLY behind HTTPS
-    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+    sameSite: 'lax',
+    secure: true, // must be true for HTTPS
+    maxAge: 1000 * 60 * 60 * 24 * 7,
     path: '/',
   });
 }
-
 function authMiddleware(req, _res, next) {
   const token = req.cookies?.wti_jwt;
   if (!token) return next();
   try {
     req.user = jwt.verify(token, JWT_SECRET);
-  } catch (e) {
-    // bad/expired token -> ignore
-  }
+  } catch {}
   next();
 }
 app.use(authMiddleware);
 
-// Small helper to log full errors
-function logError(tag, err) {
-  console.error(`[${tag}]`, err && err.stack ? err.stack : err);
-}
+// --- Routes ---
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-// ---------------- ROUTES ----------------
-app.get('/', (_req, res) => res.send('✅ WTI Backend is running!'));
-
-// Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     let { email, password } = req.body || {};
     email = normEmail(email);
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
     const exists = DB.prepare('SELECT id FROM users WHERE email = ?').get(email);
     if (exists) return res.status(409).json({ error: 'Email already registered' });
 
-    const passhash = await bcrypt.hash(String(password), 10);
+    const passhash = await bcrypt.hash(password, 10);
     const info = DB.prepare('INSERT INTO users (email, passhash) VALUES (?, ?)').run(email, passhash);
+    const user = { id: info.lastInsertRowid, email };
 
-    // better-sqlite3 lastInsertRowid can be bigint-like — force to Number
-    const user = { id: Number(info.lastInsertRowid), email };
     const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
     setAuthCookie(res, token);
-
-    console.log('[REGISTER] ok:', email);
     res.json({ ok: true, user });
   } catch (e) {
-    logError('REGISTER', e);
+    console.error('[REGISTER] error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Login
 app.post('/api/auth/login', async (req, res) => {
   try {
     let { email, password } = req.body || {};
     email = normEmail(email);
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
     const row = DB.prepare('SELECT id, email, passhash FROM users WHERE email = ?').get(email);
-    if (!row) {
-      console.warn('[LOGIN] unknown email:', email);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    if (!row) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const ok = await bcrypt.compare(String(password), String(row.passhash));
-    if (!ok) {
-      console.warn('[LOGIN] bad password for:', email);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    const ok = await bcrypt.compare(password, row.passhash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const user = { id: Number(row.id), email: row.email };
+    const user = { id: row.id, email: row.email };
     const token = jwt.sign(user, JWT_SECRET, { expiresIn: '7d' });
     setAuthCookie(res, token);
-
-    console.log('[LOGIN] ok:', email);
     res.json({ ok: true, user });
   } catch (e) {
-    logError('LOGIN', e);
+    console.error('[LOGIN] error:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Logout
-app.post('/api/auth/logout', (_req, res) => {
+app.post('/api/auth/logout', (req, res) => {
   res.clearCookie('wti_jwt', { path: '/' });
   res.json({ ok: true });
 });
 
-// Current user
 app.get('/api/me', (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
   res.json({ user: req.user });
 });
 
-// ---------------- START ----------------
 app.listen(PORT, () => {
-  console.log(`WTI backend running at http://localhost:${PORT}`);
-  console.log(`CORS allowed origins: ${FRONTEND_ORIGINS.join(', ')}`);
+  console.log(`✅ WTI backend running on port ${PORT}`);
+  console.log(`CORS allowed origin: ${FRONTEND_ORIGIN}`);
 });
